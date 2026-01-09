@@ -1,50 +1,48 @@
 import os
 from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings  # Cập nhật thư viện mới
 from langchain_community.vectorstores import FAISS
 
-# Đường dẫn gốc của folder nlp
+# 1. Cấu hình đường dẫn động để chạy được cả Local và Docker
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "data")
+DB_SAVE_PATH = os.path.join(BASE_DIR, "faiss_index")
 
-
-def create_vector_db(user_id="user_default"):
-    # 1. Định nghĩa đường dẫn riêng biệt theo user_id
-    data_path = os.path.join(BASE_DIR, "data", user_id)
-    db_save_path = os.path.join(BASE_DIR, "faiss_index", user_id)
-
-    # Kiểm tra thư mục data của user
-    if not os.path.exists(data_path):
-        os.makedirs(data_path)
-        print(f"Thư mục trống, hãy upload PDF cho user: {user_id}")
-        return
-
-    # 2. Tải tài liệu PDF từ thư mục riêng của user
-    loader = DirectoryLoader(data_path, glob='*.pdf', loader_cls=PyPDFLoader)
-    documents = loader.load()
-
-    if not documents:
-        print(f"Không tìm thấy tài liệu PDF nào trong {data_path}")
-        return
-
-    # 3. Chia nhỏ văn bản
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500, chunk_overlap=50)
-    texts = text_splitter.split_documents(documents)
-
-    # 4. Embedding
-    # Thay thế dòng cũ bằng dòng này để ép mô hình chạy trên CPU và không cache quá nhiều
+# 2. Khởi tạo Embedding (Để ở ngoài để dùng chung)
+# Sử dụng CPU để tránh lỗi Out of Memory trên Render/Local
 embeddings = HuggingFaceEmbeddings(
     model_name='sentence-transformers/all-MiniLM-L6-v2',
     model_kwargs={'device': 'cpu'},
     encode_kwargs={'normalize_embeddings': True}
 )
 
-# 5. Lưu trữ kho Vector vào thư mục riêng của user
-db = FAISS.from_documents(texts, embeddings)
-db.save_local(db_save_path)
-print(f"✅ AI đã học xong cho {user_id}! Lưu tại: {db_save_path}")
+def create_vector_db():
+    """Hàm xử lý PDF và tạo kho Vector"""
+    if not os.path.exists(DATA_PATH):
+        os.makedirs(DATA_PATH)
+        print(f"Thư mục {DATA_PATH} mới được tạo, hãy bỏ file PDF vào đó.")
+        return None
 
+    # Tải tài liệu
+    loader = DirectoryLoader(DATA_PATH, glob="*.pdf", loader_cls=PyPDFLoader)
+    documents = loader.load()
+    
+    if not documents:
+        print(f"❌ Không tìm thấy tài liệu PDF nào trong {DATA_PATH}")
+        return None
+    
+    # Chia nhỏ văn bản
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    texts = text_splitter.split_documents(documents)
+    
+    # Tạo và lưu Vector Store
+    db = FAISS.from_documents(texts, embeddings)
+    db.save_local(DB_SAVE_PATH)
+    print(f"✅ AI đã học xong! Dữ liệu lưu tại: {DB_SAVE_PATH}")
+    return db
+
+# QUAN TRỌNG: Không để các lệnh chạy logic ở đây ngoài hàm
+# Chỉ chạy khi thực thi trực tiếp file này
 if __name__ == "__main__":
-    # Mặc định chạy cho user_default nếu chạy file này thủ công
     create_vector_db()

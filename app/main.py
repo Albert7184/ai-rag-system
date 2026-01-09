@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os, shutil, sqlite3, hashlib
 import google.generativeai as genai
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings # Cập nhật thư viện mới
 from langchain_community.vectorstores import FAISS
 from app.nlp.ingest import create_vector_db as run_ingest
 
@@ -12,10 +12,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # --- CẤU HÌNH HỆ THỐNG ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(CURRENT_DIR, "users.db")
-genai.configure(api_key="AIzaSyBxj-bpDICFQkL-WrZqH9qNseUbfTZaFPQ")
+# Đảm bảo đường dẫn DB trỏ đúng vào thư mục gốc của project để Docker Volume nhận diện được
+DB_PATH = os.path.join(os.path.dirname(CURRENT_DIR), "users.db") 
+
+# BẢO MẬT: Lấy API Key từ biến môi trường thay vì ghi đè trực tiếp
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBxj-bpDICFQkL-WrZqH9qNseUbfTZaFPQ")
+genai.configure(api_key=GEMINI_KEY)
+
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-embeddings = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
+
+# Sử dụng CPU để tiết kiệm RAM khi chạy trên Ubuntu/Docker
+embeddings = HuggingFaceEmbeddings(
+    model_name='sentence-transformers/all-MiniLM-L6-v2',
+    model_kwargs={'device': 'cpu'}
+)
 
 # --- KHỞI TẠO DATABASE ---
 def init_db():
@@ -23,7 +33,7 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT)')
     cursor.execute('''CREATE TABLE IF NOT EXISTS chat_history 
-                     (username TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+                      (username TEXT, role TEXT, content TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     conn.commit()
     conn.close()
 
@@ -64,7 +74,8 @@ def predict(data: UserInput):
     docs = db.similarity_search(data.message, k=3)
     context = "\n".join([d.page_content for d in docs])
     
-    response = gemini_model.generate_content(f"Dựa vào: {context}\nTrả lời: {data.message}")
+    prompt = f"Dựa vào ngữ cảnh sau đây:\n{context}\n\nHãy trả lời câu hỏi: {data.message}"
+    response = gemini_model.generate_content(prompt)
     
     # Lưu lịch sử
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
@@ -86,9 +97,13 @@ def get_history(user_id: str):
 async def upload(user_id: str, file: UploadFile = File(...)):
     path = os.path.join(CURRENT_DIR, "nlp", "data", user_id)
     os.makedirs(path, exist_ok=True)
-    with open(os.path.join(path, file.filename), "wb") as f: shutil.copyfileobj(file.file, f)
+    file_path = os.path.join(path, file.filename)
+    with open(file_path, "wb") as f: 
+        shutil.copyfileobj(file.file, f)
+    
+    # Sau khi upload thành công, gọi hàm ingest để cập nhật Vector DB cho user đó
     run_ingest(user_id=user_id)
-    return {"message": "Đã học tài liệu"}
+    return {"message": f"Đã học tài liệu: {file.filename}"}
 
 @app.get("/files/{user_id}")
 def list_files(user_id: str):
@@ -97,6 +112,9 @@ def list_files(user_id: str):
 
 @app.delete("/files/{user_id}/{name}")
 def delete_file(user_id: str, name: str):
-    os.remove(os.path.join(CURRENT_DIR, "nlp", "data", user_id, name))
-    run_ingest(user_id=user_id)
-    return {"message": "Đã xóa"}
+    file_path = os.path.join(CURRENT_DIR, "nlp", "data", user_id, name)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        run_ingest(user_id=user_id) # Cập nhật lại database sau khi xóa file
+        return {"message": "Đã xóa"}
+    raise HTTPException(404, "Không tìm thấy file")
