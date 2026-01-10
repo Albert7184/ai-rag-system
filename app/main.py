@@ -4,15 +4,20 @@ from pydantic import BaseModel
 import os, shutil, sqlite3, hashlib
 import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
-# Đảm bảo import đúng từ cấu trúc thư mục của bạn
-from app.nlp.ingest import create_vector_db as run_ingest, get_embeddings
+
+# Hỗ trợ import linh hoạt cho cả Local và Docker
+try:
+    from app.nlp.ingest import create_vector_db as run_ingest, get_embeddings
+except ImportError:
+    from nlp.ingest import create_vector_db as run_ingest, get_embeddings
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- CẤU HÌNH ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(os.path.dirname(CURRENT_DIR), "users.db") 
+# Đặt database ngay trong folder app để dễ quản lý local
+DB_PATH = os.path.join(CURRENT_DIR, "users.db") 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
 if GEMINI_KEY:
@@ -42,11 +47,12 @@ class UserInput(BaseModel):
     message: str
     user_id: str
 
-# --- AUTH ENDPOINTS (Bổ sung phần này) ---
+# --- AUTH ENDPOINTS ---
 @app.post("/register")
 def register(user: UserAuth):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    if user.username.lower() == "guest":
+        raise HTTPException(status_code=400, detail="Không thể đăng ký với tên guest")
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     try:
         cursor.execute('INSERT INTO users (username, password) VALUES (?, ?)', 
                        (user.username, hash_pass(user.password)))
@@ -59,8 +65,7 @@ def register(user: UserAuth):
 
 @app.post("/login")
 def login(user: UserAuth):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute('SELECT * FROM users WHERE username = ? AND password = ?', 
                    (user.username, hash_pass(user.password)))
     result = cursor.fetchone()
@@ -69,7 +74,7 @@ def login(user: UserAuth):
         return {"message": "Đăng nhập thành công"}
     raise HTTPException(status_code=401, detail="Sai tài khoản hoặc mật khẩu")
 
-# --- DATA & HISTORY ENDPOINTS (Bổ sung phần này) ---
+# --- DATA & HISTORY ENDPOINTS ---
 @app.get("/history/{user_id}")
 def get_history(user_id: str):
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
@@ -80,6 +85,7 @@ def get_history(user_id: str):
 
 @app.get("/files/{user_id}")
 def list_files(user_id: str):
+    # Đường dẫn nlp/data/user_id
     path = os.path.join(CURRENT_DIR, "nlp", "data", user_id)
     if not os.path.exists(path): return {"files": []}
     return {"files": os.listdir(path)}
@@ -95,9 +101,12 @@ def delete_file(user_id: str, filename: str):
 # --- CHAT & RAG ENDPOINTS ---
 @app.post("/predict")
 def predict(data: UserInput):
-    user_db_path = os.path.join(CURRENT_DIR, "nlp", "faiss_index", data.user_id)
+    # Nếu user_id trống, mặc định là guest
+    uid = data.user_id if data.user_id else "guest"
+    user_db_path = os.path.join(CURRENT_DIR, "nlp", "faiss_index", uid)
+    
     if not os.path.exists(user_db_path):
-        return {"reply": "Bạn chưa tải tài liệu nào lên. Hãy upload PDF trước nhé!"}
+        return {"reply": "Chế độ Khách: Hãy upload PDF ở sidebar để bắt đầu hỏi nhé!"}
     
     try:
         embeddings = get_embeddings()
@@ -108,27 +117,34 @@ def predict(data: UserInput):
         prompt = f"Dựa vào văn bản đã tải lên:\n{context}\n\nCâu hỏi: {data.message}"
         response = gemini_model.generate_content(prompt)
         
+        # Lưu lịch sử chat (cho cả guest và user)
         conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-        cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'user', ?)", (data.user_id, data.message))
-        cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'assistant', ?)", (data.user_id, response.text))
+        cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'user', ?)", (uid, data.message))
+        cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'assistant', ?)", (uid, response.text))
         conn.commit(); conn.close()
         
         return {"reply": response.text}
     except Exception as e:
-        return {"reply": f"Lỗi xử lý: {str(e)}"}
+        return {"reply": f"Lỗi xử lý AI: {str(e)}"}
 
 @app.post("/upload")
 async def upload(user_id: str, file: UploadFile = File(...)):
-    path = os.path.join(CURRENT_DIR, "nlp", "data", user_id)
+    uid = user_id if user_id else "guest"
+    # Tạo folder data/guest hoặc data/user_id
+    path = os.path.join(CURRENT_DIR, "nlp", "data", uid)
     os.makedirs(path, exist_ok=True)
     file_path = os.path.join(path, file.filename)
+    
     with open(file_path, "wb") as f: 
         shutil.copyfileobj(file.file, f)
-    run_ingest(user_id=user_id)
+    
+    # Chạy hàm học tài liệu cho ID tương ứng
+    run_ingest(user_id=uid)
     return {"message": f"Hệ thống đã học xong tài liệu: {file.filename}"}
 
 # --- KHỞI CHẠY ---
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 10000))
+    # Port 8000 cho local, lấy biến môi trường cho Render
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
