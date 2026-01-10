@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import os, shutil, sqlite3, hashlib
 import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
-# Import từ file ingest.py cùng thư mục nlp
+# Đảm bảo import đúng từ cấu trúc thư mục của bạn
 from app.nlp.ingest import create_vector_db as run_ingest, get_embeddings
 
 app = FastAPI()
@@ -12,7 +12,6 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 # --- CẤU HÌNH ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Đưa database ra ngoài folder app để tránh bị xóa khi redeploy (nếu dùng đĩa cứng gắn ngoài)
 DB_PATH = os.path.join(os.path.dirname(CURRENT_DIR), "users.db") 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -20,6 +19,7 @@ if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
+# --- DATABASE ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -31,15 +31,71 @@ def init_db():
 
 init_db()
 
-def hash_pass(password: str): return hashlib.sha256(password.encode()).hexdigest()
-class UserAuth(BaseModel): username: str; password: str
-class UserInput(BaseModel): message: str; user_id: str
+def hash_pass(password: str): 
+    return hashlib.sha256(password.encode()).hexdigest()
 
+class UserAuth(BaseModel): 
+    username: str
+    password: str
+
+class UserInput(BaseModel): 
+    message: str
+    user_id: str
+
+# --- AUTH ENDPOINTS (Bổ sung phần này) ---
+@app.post("/register")
+def register(user: UserAuth):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute('INSERT INTO users (username, password) VALUES (?, ?)', 
+                       (user.username, hash_pass(user.password)))
+        conn.commit()
+        return {"message": "Đăng ký thành công"}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Tài khoản đã tồn tại")
+    finally:
+        conn.close()
+
+@app.post("/login")
+def login(user: UserAuth):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM users WHERE username = ? AND password = ?', 
+                   (user.username, hash_pass(user.password)))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return {"message": "Đăng nhập thành công"}
+    raise HTTPException(status_code=401, detail="Sai tài khoản hoặc mật khẩu")
+
+# --- DATA & HISTORY ENDPOINTS (Bổ sung phần này) ---
+@app.get("/history/{user_id}")
+def get_history(user_id: str):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("SELECT role, content FROM chat_history WHERE username = ? ORDER BY timestamp ASC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"role": r, "content": c} for r, c in rows]
+
+@app.get("/files/{user_id}")
+def list_files(user_id: str):
+    path = os.path.join(CURRENT_DIR, "nlp", "data", user_id)
+    if not os.path.exists(path): return {"files": []}
+    return {"files": os.listdir(path)}
+
+@app.delete("/files/{user_id}/{filename}")
+def delete_file(user_id: str, filename: str):
+    file_path = os.path.join(CURRENT_DIR, "nlp", "data", user_id, filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        return {"message": "Xóa thành công"}
+    raise HTTPException(status_code=404, detail="File không tồn tại")
+
+# --- CHAT & RAG ENDPOINTS ---
 @app.post("/predict")
 def predict(data: UserInput):
-    # Đường dẫn trỏ đúng vào folder faiss_index trong nlp
     user_db_path = os.path.join(CURRENT_DIR, "nlp", "faiss_index", data.user_id)
-    
     if not os.path.exists(user_db_path):
         return {"reply": "Bạn chưa tải tài liệu nào lên. Hãy upload PDF trước nhé!"}
     
@@ -52,7 +108,6 @@ def predict(data: UserInput):
         prompt = f"Dựa vào văn bản đã tải lên:\n{context}\n\nCâu hỏi: {data.message}"
         response = gemini_model.generate_content(prompt)
         
-        # Lưu lịch sử chat
         conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
         cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'user', ?)", (data.user_id, data.message))
         cur.execute("INSERT INTO chat_history (username, role, content) VALUES (?, 'assistant', ?)", (data.user_id, response.text))
@@ -67,17 +122,13 @@ async def upload(user_id: str, file: UploadFile = File(...)):
     path = os.path.join(CURRENT_DIR, "nlp", "data", user_id)
     os.makedirs(path, exist_ok=True)
     file_path = os.path.join(path, file.filename)
-    
     with open(file_path, "wb") as f: 
         shutil.copyfileobj(file.file, f)
-    
-    # Chạy hàm học tài liệu
     run_ingest(user_id=user_id)
     return {"message": f"Hệ thống đã học xong tài liệu: {file.filename}"}
 
 # --- KHỞI CHẠY ---
 if __name__ == "__main__":
     import uvicorn
-    # Render yêu cầu dùng Port từ biến môi trường
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
